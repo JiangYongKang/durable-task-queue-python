@@ -1,7 +1,13 @@
 """Queue service: submission, dedup, leasing, retry, and terminal states."""
 
+import json
+import sqlite3
+import time
+import uuid
+from collections.abc import Callable
+
 from taskqueue.config import QueueConfig
-from taskqueue.models import Task, TaskEvent
+from taskqueue.models import Task, TaskEvent, TaskState
 from taskqueue.storage import Storage
 
 
@@ -13,33 +19,109 @@ class SubmitRejected(Exception):
         self.reason = reason
 
 
+class LeaseError(Exception):
+    """Lease is missing, expired, or does not match the task."""
+
+
 class QueueService:
-    def __init__(self, config: QueueConfig) -> None:
+    def __init__(self, config: QueueConfig, clock: Callable[[], float] = time.time) -> None:
         self._config = config
+        self._clock = clock
         self._storage = Storage(config)
 
     def open(self) -> None:
-        raise NotImplementedError
+        self._storage.open()
 
     def close(self) -> None:
-        raise NotImplementedError
+        self._storage.close()
 
-    def submit(self, idempotency_key: str, payload: object) -> tuple[Task, bool]:
+    def __enter__(self) -> "QueueService":
+        self.open()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # -- submission ------------------------------------------------------
+
+    def _canonical_payload(self, payload: object) -> str:
+        try:
+            return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise SubmitRejected("invalid_payload", f"payload is not JSON-serializable: {exc}")
+
+    def submit(self, idempotency_key: object, payload: object) -> tuple[Task, bool]:
         """Submit a task; returns (task, created). Raises SubmitRejected."""
-        raise NotImplementedError
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise SubmitRejected(
+                "invalid_idempotency_key", "idempotency_key must be a non-empty string"
+            )
+        canonical = self._canonical_payload(payload)
+        if len(canonical.encode("utf-8")) > self._config.max_payload_bytes:
+            raise SubmitRejected(
+                "payload_too_large",
+                f"payload exceeds {self._config.max_payload_bytes} bytes",
+            )
+        existing = self._storage.get_task_by_key(idempotency_key)
+        if existing is not None:
+            if existing.payload == canonical:
+                return existing, False
+            raise SubmitRejected(
+                "payload_conflict",
+                "idempotency_key already used with a different payload",
+            )
+        now = self._clock()
+        task = Task(
+            task_id=uuid.uuid4().hex,
+            idempotency_key=idempotency_key,
+            payload=canonical,
+            state=TaskState.PENDING,
+            attempts=0,
+            max_attempts=self._config.max_attempts,
+            created_at=now,
+            updated_at=now,
+        )
+        try:
+            self._storage.insert_task(task)
+        except sqlite3.IntegrityError:
+            # Lost a submit race; the stored row is authoritative.
+            winner = self._storage.get_task_by_key(idempotency_key)
+            assert winner is not None
+            if winner.payload == canonical:
+                return winner, False
+            raise SubmitRejected(
+                "payload_conflict",
+                "idempotency_key already used with a different payload",
+            )
+        return task, True
+
+    # -- consumption -----------------------------------------------------
 
     def acquire(self) -> tuple[Task, str] | None:
         """Lease the next deliverable task; returns (task, lease_id)."""
-        raise NotImplementedError
+        task = self._storage.acquire_lease(self._clock(), self._config.lease_seconds)
+        if task is None or task.lease_id is None:
+            return None
+        return task, task.lease_id
 
     def ack(self, task_id: str, lease_id: str) -> Task:
-        raise NotImplementedError
+        task = self._storage.complete_task(task_id, lease_id, self._clock())
+        if task is None:
+            raise LeaseError(f"no valid lease {lease_id} for task {task_id}")
+        return task
 
     def fail(self, task_id: str, lease_id: str, retryable: bool) -> Task:
-        raise NotImplementedError
+        task = self._storage.fail_task(
+            task_id, lease_id, retryable, self._clock(), self._config.max_attempts
+        )
+        if task is None:
+            raise LeaseError(f"no valid lease {lease_id} for task {task_id}")
+        return task
+
+    # -- queries ---------------------------------------------------------
 
     def get_task(self, task_id: str) -> Task | None:
-        raise NotImplementedError
+        return self._storage.get_task(task_id)
 
     def get_history(self, task_id: str) -> list[TaskEvent]:
-        raise NotImplementedError
+        return self._storage.list_events(task_id)
