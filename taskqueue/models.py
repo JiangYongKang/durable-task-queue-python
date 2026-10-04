@@ -7,6 +7,7 @@ from enum import Enum
 class TaskState(str, Enum):
     PENDING = "pending"
     LEASED = "leased"
+    WAITING = "waiting"  # retryable failure; held until not_before elapses
     SUCCEEDED = "succeeded"
     FAILED = "failed"  # non-retryable terminal failure
     DEAD = "dead"  # exhausted retries, moved to dead letter
@@ -29,6 +30,7 @@ class Task:
     updated_at: float
     lease_id: str | None = None
     lease_expires_at: float | None = None
+    not_before: float | None = None  # WAITING tasks become deliverable at this time
 
 
 @dataclass

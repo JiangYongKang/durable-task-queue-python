@@ -44,6 +44,7 @@ def _task_view(task: Task) -> dict:
         "max_attempts": task.max_attempts,
         "lease_id": task.lease_id,
         "lease_expires_at": task.lease_expires_at,
+        "not_before": task.not_before,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
     }
@@ -65,6 +66,9 @@ def config_from_env() -> QueueConfig:
         lease_seconds=float(os.environ.get("TQ_LEASE_SECONDS", "30")),
         max_attempts=int(os.environ.get("TQ_MAX_ATTEMPTS", "3")),
         max_payload_bytes=int(os.environ.get("TQ_MAX_PAYLOAD_BYTES", str(64 * 1024))),
+        retry_initial_delay=float(os.environ.get("TQ_RETRY_INITIAL_DELAY", "0")),
+        retry_max_delay=float(os.environ.get("TQ_RETRY_MAX_DELAY", "60")),
+        retry_backoff_factor=float(os.environ.get("TQ_RETRY_BACKOFF_FACTOR", "2")),
     )
 
 

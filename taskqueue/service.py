@@ -1,6 +1,7 @@
 """Queue service: submission, dedup, leasing, retry, and terminal states."""
 
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -9,6 +10,8 @@ from collections.abc import Callable
 from taskqueue.config import QueueConfig
 from taskqueue.models import Task, TaskEvent, TaskState
 from taskqueue.storage import Storage
+
+log = logging.getLogger("taskqueue.service")
 
 
 class SubmitRejected(Exception):
@@ -102,20 +105,43 @@ class QueueService:
         task = self._storage.acquire_lease(self._clock(), self._config.lease_seconds)
         if task is None or task.lease_id is None:
             return None
+        log.info(
+            "acquire idempotency_key=%s task_id=%s lease_id=%s attempt=%d/%d"
+            " redelivered=%s",
+            task.idempotency_key, task.task_id, task.lease_id, task.attempts,
+            task.max_attempts, task.attempts > 1,
+        )
         return task, task.lease_id
 
     def ack(self, task_id: str, lease_id: str) -> Task:
         task = self._storage.complete_task(task_id, lease_id, self._clock())
         if task is None:
             raise LeaseError(f"no valid lease {lease_id} for task {task_id}")
+        log.info(
+            "ack idempotency_key=%s task_id=%s lease_id=%s attempts=%d",
+            task.idempotency_key, task_id, lease_id, task.attempts,
+        )
         return task
 
     def fail(self, task_id: str, lease_id: str, retryable: bool) -> Task:
         task = self._storage.fail_task(
-            task_id, lease_id, retryable, self._clock(), self._config.max_attempts
+            task_id, lease_id, retryable, self._clock(), self._config
         )
         if task is None:
+            log.info(
+                "fail rejected lease_id=%s task_id=%s (stale/unknown lease)",
+                lease_id, task_id,
+            )
             raise LeaseError(f"no valid lease {lease_id} for task {task_id}")
+        wait_info = (
+            f" not_before={task.not_before}" if task.not_before is not None else ""
+        )
+        log.info(
+            "fail idempotency_key=%s task_id=%s lease_id=%s attempt=%d/%d"
+            " retryable=%s state=%s%s",
+            task.idempotency_key, task_id, lease_id, task.attempts,
+            task.max_attempts, retryable, task.state.value, wait_info,
+        )
         return task
 
     # -- queries ---------------------------------------------------------
