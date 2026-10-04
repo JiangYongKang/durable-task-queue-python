@@ -110,9 +110,25 @@ class QueueService:
             raise LeaseError(f"no valid lease {lease_id} for task {task_id}")
         return task
 
+    def _retry_delay(self, attempts: int) -> float:
+        """Backoff wait before the next delivery, given failures so far.
+
+        Grows exponentially from retry_initial_delay_seconds and is capped at
+        retry_max_delay_seconds: attempt 1 -> initial, 2 -> 2x, 3 -> 4x, ...
+        """
+        cfg = self._config
+        delay = cfg.retry_initial_delay_seconds * (2 ** max(0, attempts - 1))
+        return min(delay, cfg.retry_max_delay_seconds)
+
     def fail(self, task_id: str, lease_id: str, retryable: bool) -> Task:
+        # Read attempts first to size the backoff; attempts only change on
+        # acquire, so the value cannot race with this fail for the same lease.
+        current = self._storage.get_task(task_id)
+        attempts = current.attempts if current is not None else 0
+        delay = self._retry_delay(attempts) if retryable else 0.0
         task = self._storage.fail_task(
-            task_id, lease_id, retryable, self._clock(), self._config.max_attempts
+            task_id, lease_id, retryable, self._clock(),
+            self._config.max_attempts, delay,
         )
         if task is None:
             raise LeaseError(f"no valid lease {lease_id} for task {task_id}")

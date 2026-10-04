@@ -29,6 +29,9 @@ def svc(tmp_path):
             db_path=os.path.join(tmp_path, "test.db"),
             lease_seconds=0.1,
             max_attempts=3,
+            # Zero initial delay keeps the legacy immediate-redelivery
+            # behavior for these pre-backoff tests.
+            retry_initial_delay_seconds=0.0,
         )
     )
     service.open()

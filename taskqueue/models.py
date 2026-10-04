@@ -29,6 +29,9 @@ class Task:
     updated_at: float
     lease_id: str | None = None
     lease_expires_at: float | None = None
+    # Earliest time the task may be delivered again; None means immediately.
+    # Set when a retryable failure schedules a backoff wait.
+    next_attempt_at: float | None = None
 
 
 @dataclass

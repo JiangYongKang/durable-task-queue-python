@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     max_attempts INTEGER NOT NULL,
     lease_id TEXT,
     lease_expires_at REAL,
+    next_attempt_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -52,6 +53,14 @@ class Storage:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the initial schema (idempotent)."""
+        conn = self._require_conn()
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        if "next_attempt_at" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN next_attempt_at REAL")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -76,6 +85,7 @@ class Storage:
             max_attempts=row["max_attempts"],
             lease_id=row["lease_id"],
             lease_expires_at=row["lease_expires_at"],
+            next_attempt_at=row["next_attempt_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -98,8 +108,9 @@ class Storage:
             try:
                 conn.execute(
                     "INSERT INTO tasks (task_id, idempotency_key, payload, state, attempts,"
-                    " max_attempts, lease_id, lease_expires_at, created_at, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    " max_attempts, lease_id, lease_expires_at, next_attempt_at,"
+                    " created_at, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         task.task_id,
                         task.idempotency_key,
@@ -109,6 +120,7 @@ class Storage:
                         task.max_attempts,
                         task.lease_id,
                         task.lease_expires_at,
+                        task.next_attempt_at,
                         task.created_at,
                         task.updated_at,
                     ),
@@ -137,40 +149,55 @@ class Storage:
     def acquire_lease(self, now: float, lease_seconds: float) -> Task | None:
         """Atomically lease the next deliverable task.
 
-        Deliverable means PENDING, or LEASED with an expired lease (the previous
+        Deliverable means PENDING and past its backoff wait (next_attempt_at
+        is NULL or <= now), or LEASED with an expired lease (the previous
         consumer timed out or crashed). Increments attempts per delivery.
+        Tasks still in their backoff wait are invisible here, so they never
+        block newer tasks that are already deliverable.
         """
         conn = self._require_conn()
         with self._lock:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM tasks WHERE state=? OR (state=? AND lease_expires_at<=?)"
-                    " ORDER BY created_at LIMIT 1",
-                    (TaskState.PENDING.value, TaskState.LEASED.value, now),
+                    "SELECT * FROM tasks WHERE"
+                    " (state=? AND (next_attempt_at IS NULL OR next_attempt_at<=?))"
+                    " OR (state=? AND lease_expires_at<=?)"
+                    " ORDER BY COALESCE(next_attempt_at, created_at) LIMIT 1",
+                    (
+                        TaskState.PENDING.value,
+                        now,
+                        TaskState.LEASED.value,
+                        now,
+                    ),
                 ).fetchone()
                 if row is None:
                     conn.execute("COMMIT")
                     return None
                 task = self._row_to_task(row)
+                waited_detail = ""
                 if task.state == TaskState.LEASED:
                     self._add_event(
                         conn, task.task_id, "lease_expired",
                         f"stale lease_id={task.lease_id} expired_at={task.lease_expires_at}",
                         now,
                     )
+                elif task.next_attempt_at is not None:
+                    # Redelivery after a backoff wait: updated_at was the
+                    # failure time, so this is how long it actually waited.
+                    waited_detail = f" waited_seconds={now - task.updated_at:.6f}"
                 lease_id = uuid.uuid4().hex
                 attempts = task.attempts + 1
                 expires = now + lease_seconds
                 conn.execute(
                     "UPDATE tasks SET state=?, attempts=?, lease_id=?, lease_expires_at=?,"
-                    " updated_at=? WHERE task_id=?",
+                    " next_attempt_at=NULL, updated_at=? WHERE task_id=?",
                     (TaskState.LEASED.value, attempts, lease_id, expires, now, task.task_id),
                 )
                 self._add_event(
                     conn, task.task_id, "leased",
                     f"lease_id={lease_id} attempt={attempts}/{task.max_attempts}"
-                    f" expires_at={expires}",
+                    f" expires_at={expires}{waited_detail}",
                     now,
                 )
                 conn.execute("COMMIT")
@@ -222,9 +249,20 @@ class Storage:
                 raise
 
     def fail_task(
-        self, task_id: str, lease_id: str, retryable: bool, now: float, max_attempts: int
+        self,
+        task_id: str,
+        lease_id: str,
+        retryable: bool,
+        now: float,
+        max_attempts: int,
+        retry_delay_seconds: float = 0.0,
     ) -> Task | None:
-        """Record a failure; route to PENDING (retry), DEAD, or FAILED."""
+        """Record a failure; route to PENDING (scheduled retry), DEAD, or FAILED.
+
+        A retryable failure below the attempt cap goes back to PENDING with
+        next_attempt_at = now + retry_delay_seconds, so it stays invisible to
+        consumers until the backoff wait elapses.
+        """
         conn = self._require_conn()
         with self._lock:
             conn.execute("BEGIN IMMEDIATE")
@@ -233,21 +271,28 @@ class Storage:
                 if task is None:
                     conn.execute("COMMIT")
                     return None
+                next_attempt_at: float | None = None
+                schedule_detail = ""
                 if not retryable:
                     new_state, event = TaskState.FAILED, "failed_non_retryable"
                 elif task.attempts >= max_attempts:
                     new_state, event = TaskState.DEAD, "dead_lettered"
                 else:
                     new_state, event = TaskState.PENDING, "failed_retryable"
+                    next_attempt_at = now + retry_delay_seconds
+                    schedule_detail = (
+                        f" delay_seconds={retry_delay_seconds:.6f}"
+                        f" next_attempt_at={next_attempt_at}"
+                    )
                 conn.execute(
                     "UPDATE tasks SET state=?, lease_id=NULL, lease_expires_at=NULL,"
-                    " updated_at=? WHERE task_id=?",
-                    (new_state.value, now, task_id),
+                    " next_attempt_at=?, updated_at=? WHERE task_id=?",
+                    (new_state.value, next_attempt_at, now, task_id),
                 )
                 self._add_event(
                     conn, task_id, event,
                     f"lease_id={lease_id} attempt={task.attempts}/{max_attempts}"
-                    f" retryable={retryable}",
+                    f" retryable={retryable}{schedule_detail}",
                     now,
                 )
                 conn.execute("COMMIT")
